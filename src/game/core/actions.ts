@@ -2,7 +2,7 @@
 // 零点接线台 — Game Actions
 // ============================================================
 
-import type { TriageLevel, MpdsDeterminant, FragmentTargetField, TerminalJudgmentField } from '../types'
+import type { TriageLevel, MpdsDeterminant, FragmentTargetField } from '../types'
 
 export type TerminalField = 'address' | 'contact' | 'chiefComplaint' | 'patientAge' | 'patientGender' | 'conditionNote'
 

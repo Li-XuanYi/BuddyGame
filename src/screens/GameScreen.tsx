@@ -3,7 +3,7 @@
 // ============================================================
 
 import { useReducer, useEffect, useRef, useCallback, useState } from 'react'
-import type { TriageLevel, MpdsDeterminant, CallPhase, TerminalState, InfoQuality, CalleeStressLevel } from '../game/types'
+import type { TriageLevel, MpdsDeterminant, CallPhase, TerminalState, CalleeStressLevel } from '../game/types'
 import { MPDS_DETERMINANT_INFO, STRESS_INFO } from '../game/types'
 import type { TerminalField } from '../game/core/actions'
 import { worldReducer } from '../game/core/worldReducer'
@@ -11,6 +11,13 @@ import { createInitialState } from '../game/core/initialState'
 import { getCaller } from '../game/npc/personas'
 import { detectEnding } from '../game/endings/endings'
 import { Hud } from '../components/hud/Hud'
+import { AudioControl } from '../audio/AudioControl'
+import { useGameAudio } from '../audio/useGameAudio'
+import {
+  crossedDispatchWarning,
+  formatPlayerDeterminantCode,
+  getDispatchTimingState,
+} from '../game/core/dispatchTiming'
 import type { EndingDef } from '../game/types'
 
 interface Props {
@@ -27,6 +34,10 @@ const TRIAGE_OPTIONS: { level: TriageLevel; label: string; color: string; desc: 
 export function GameScreen({ onNavigate }: Props) {
   const [state, dispatch] = useReducer(worldReducer, null, createInitialState)
   const [terminalModalOpen, setTerminalModalOpen] = useState(false)
+  const audio = useGameAudio()
+  const previousAmbulanceRemaining = useRef(state.ambulanceRemaining)
+  const previousCallElapsed = useRef(0)
+  const previousCallId = useRef<string | null>(null)
 
   // --- 初始化班次 ---
   useEffect(() => {
@@ -45,13 +56,37 @@ export function GameScreen({ onNavigate }: Props) {
     return () => clearInterval(id)
   }, [state.screen])
 
+  useEffect(() => {
+    const elapsed = state.shiftElapsed - state.callStartTime
+    const callId = state.currentCall?.id ?? null
+    if (!callId) {
+      previousCallElapsed.current = 0
+      previousCallId.current = null
+      return
+    }
+
+    if (previousCallId.current !== callId) {
+      previousCallElapsed.current = 0
+      previousCallId.current = callId
+    }
+
+    if (crossedDispatchWarning(previousCallElapsed.current, elapsed)) audio.play('warning')
+    previousCallElapsed.current = elapsed
+  }, [audio, state.callStartTime, state.currentCall, state.shiftElapsed])
+
+  useEffect(() => {
+    const previous = previousAmbulanceRemaining.current
+    if (previous > 0 && state.ambulanceRemaining === 0) audio.play('arrival')
+    previousAmbulanceRemaining.current = state.ambulanceRemaining
+  }, [audio, state.ambulanceRemaining])
+
   // --- 检测结局 ---
   useEffect(() => {
     if (state.screen === 'ending') {
       const ending = detectEnding(state.totalScore)
       onNavigate('ending', ending, state.totalScore)
     }
-  }, [state.screen])
+  }, [onNavigate, state.screen, state.totalScore])
 
   // --- 自动滚动对话 ---
   const dialogueRef = useRef<HTMLDivElement>(null)
@@ -66,7 +101,9 @@ export function GameScreen({ onNavigate }: Props) {
   const pendingSet = useRef(new Set<number>())          // 已入队、尚未流式完毕的行索引
   const pendingQueue = useRef<{ idx: number; text: string }[]>([])  // 待流式的行队列
   const timerId = useRef<number | null>(null)           // 定时器
+  const queueTimeoutId = useRef<number | null>(null)    // 行间延迟定时器
   const isProcessing = useRef(false)                    // 是否正在处理队列
+  const streamingCallId = useRef<string | null>(null)
   const [streamIdx, setStreamIdx] = useState(-1)        // 正在流式的行
   const [streamPos, setStreamPos] = useState(0)         // 已显示字符数
 
@@ -96,15 +133,43 @@ export function GameScreen({ onNavigate }: Props) {
         }
         isProcessing.current = false
         // 行间短暂停顿后开始下一行
-        setTimeout(() => startQueue(), 50)
+        queueTimeoutId.current = window.setTimeout(() => {
+          queueTimeoutId.current = null
+          startQueue()
+        }, 50)
       } else {
         setStreamPos(pos)
       }
     }, 28)  // ~35 字符/秒
   }, [])
 
+  const clearStreamingWork = useCallback(() => {
+    if (timerId.current !== null) window.clearInterval(timerId.current)
+    if (queueTimeoutId.current !== null) window.clearTimeout(queueTimeoutId.current)
+    timerId.current = null
+    queueTimeoutId.current = null
+    pendingQueue.current = []
+    pendingSet.current.clear()
+    prevLogLen.current = 0
+    isProcessing.current = false
+  }, [])
+
+  useEffect(() => {
+    const callId = state.currentCall?.id ?? null
+    if (streamingCallId.current === callId) return
+    clearStreamingWork()
+    streamingCallId.current = callId
+    setStreamIdx(-1)
+    setStreamPos(0)
+  }, [clearStreamingWork, state.currentCall?.id])
+
   // 新对话行入队
   useEffect(() => {
+    if (!state.currentCall) {
+      prevLogLen.current = state.dialogueLog.length
+      return
+    }
+
     const curLen = state.dialogueLog.length
     const oldLen = prevLogLen.current
     prevLogLen.current = curLen
@@ -117,40 +182,79 @@ export function GameScreen({ onNavigate }: Props) {
     }
 
     startQueue()
-  }, [state.dialogueLog.length, startQueue])
+  }, [state.currentCall, state.dialogueLog, startQueue])
 
   // --- 安抚来电者 ---
   const handleCalm = useCallback(() => {
+    audio.play('confirm')
     dispatch({ type: 'CALM_CALLER' })
-  }, [])
+  }, [audio])
 
   // --- 打开调度卡 ---
   const handleOpenTerminal = useCallback(() => {
+    audio.play('confirm')
     setTerminalModalOpen(true)
+  }, [audio])
+
+  const handleCloseTerminal = useCallback(() => {
+    setTerminalModalOpen(false)
   }, [])
+
+  useEffect(() => () => clearStreamingWork(), [clearStreamingWork])
 
   // --- 处理派车（从模态框调用）---
   const handleDispatch = useCallback(() => {
     if (!state.currentCall) return
-    if (!state.terminal.triage) return // 模态框内已有校验
+    if (!state.terminal.triage || !state.terminal.determinant) return
+    audio.play('dispatch')
     setTerminalModalOpen(false)
     dispatch({ type: 'DISPATCH' })
-  }, [state.currentCall, state.terminal.triage])
+  }, [audio, state.currentCall, state.terminal.determinant, state.terminal.triage])
 
   // --- 处理临床判断选择 ---
   const handleJudgment = useCallback((judgmentId: string, optionIndex: number) => {
+    audio.play('confirm')
     dispatch({ type: 'MAKE_JUDGMENT', judgmentId, chosenOptionIndex: optionIndex })
-  }, [])
+  }, [audio])
+
+  const handleAnswer = useCallback(() => {
+    audio.play('connect')
+    dispatch({ type: 'ANSWER_CALL' })
+  }, [audio])
+
+  const handleAsk = useCallback((questionId: string) => {
+    audio.play('question')
+    dispatch({ type: 'ASK_QUESTION', questionId })
+  }, [audio])
+
+  const handleGuidanceAnswer = useCallback((stepIndex: number, selectedIndex: number) => {
+    audio.play('confirm')
+    dispatch({ type: 'ANSWER_GUIDANCE', stepIndex, selectedIndex })
+  }, [audio])
+
+  const handleEndCall = useCallback(() => {
+    audio.play('hangup')
+    dispatch({ type: 'END_CALL' })
+  }, [audio])
+
+  const audioControl = (
+    <AudioControl
+      enabled={audio.enabled}
+      volume={audio.volume}
+      onToggle={audio.toggle}
+      onVolume={audio.setVolume}
+    />
+  )
 
   // 无活跃通话时 — 准备接听
   if (!state.currentCall && state.callIndex < state.totalCalls) {
     return (
       <div style={styles.container}>
-        <Hud state={state} />
+        <Hud state={state} actions={audioControl} />
         <CallWaiting
           callIndex={state.callIndex}
           totalCalls={state.totalCalls}
-          onAnswer={() => dispatch({ type: 'ANSWER_CALL' })}
+          onAnswer={handleAnswer}
           shiftElapsed={state.shiftElapsed}
           totalScore={state.totalScore}
           lastScore={state.callScores[state.callScores.length - 1]}
@@ -163,7 +267,7 @@ export function GameScreen({ onNavigate }: Props) {
   if (!state.currentCall && state.callIndex >= state.totalCalls) {
     return (
       <div style={styles.container}>
-        <Hud state={state} />
+        <Hud state={state} actions={audioControl} />
         <div style={styles.centerMessage}>
           <h2 style={{ color: '#e2e8f0' }}>本班次所有通话已处理完毕</h2>
           <p style={{ color: '#94a3b8' }}>正在生成班次评估报告...</p>
@@ -175,11 +279,11 @@ export function GameScreen({ onNavigate }: Props) {
   // --- 通话中 ---
   const call = state.currentCall!
   const caller = getCaller(call.callerId)
-  const hasTriage = state.terminal.triage !== null
+  const hasDispatchDecision = state.terminal.triage !== null && state.terminal.determinant !== null
 
   return (
     <div style={styles.container}>
-      <Hud state={state} />
+      <Hud state={state} actions={audioControl} />
 
       {/* ====== 电话面板（全宽） ====== */}
       <div style={styles.phonePanel}>
@@ -238,9 +342,7 @@ export function GameScreen({ onNavigate }: Props) {
             guidance={call.guidance}
             stepIndex={state.guidanceStepIndex}
             results={state.guidanceResults}
-            onAnswer={(stepIdx, selectedIdx) =>
-              dispatch({ type: 'ANSWER_GUIDANCE', stepIndex: stepIdx, selectedIndex: selectedIdx })
-            }
+            onAnswer={handleGuidanceAnswer}
           />
         )}
 
@@ -252,10 +354,11 @@ export function GameScreen({ onNavigate }: Props) {
             stressLevel={state.callerState?.stressLevel ?? 'anxious'}
             stress={state.callerState?.stress ?? 50}
             questionCost={state.questionCost}
-            onAsk={(id) => dispatch({ type: 'ASK_QUESTION', questionId: id })}
+            onAsk={handleAsk}
             onCalm={handleCalm}
             onOpenTerminal={handleOpenTerminal}
-            hasTriage={hasTriage}
+            hasTriage={hasDispatchDecision}
+            responseMode={state.terminal.hotCold}
           />
         )}
 
@@ -265,7 +368,7 @@ export function GameScreen({ onNavigate }: Props) {
             <p style={{ color: '#4ade80', fontWeight: 'bold', marginBottom: 8 }}>
               {call.guidance ? '急救指导已完成，等待救护车到达。' : '派车指令已发出。'}
             </p>
-            <button style={styles.endCallBtn} onClick={() => dispatch({ type: 'END_CALL' })}>
+            <button style={styles.endCallBtn} onClick={handleEndCall}>
               挂断电话
             </button>
           </div>
@@ -281,18 +384,23 @@ export function GameScreen({ onNavigate }: Props) {
           ambulanceRemaining={state.ambulanceRemaining}
           canDispatch={state.callPhase === 'questioning' || state.callPhase === 'connected'}
           onChange={(field, value) =>
-            dispatch({ type: 'UPDATE_TERMINAL', field, value } as any)
+            dispatch({ type: 'UPDATE_TERMINAL', field, value })
           }
-          onSetStatus={(field, value) =>
+          onSetStatus={(field, value) => {
+            audio.play('confirm')
             dispatch({ type: 'SET_PATIENT_STATUS', field, value })
-          }
-          onSetDeterminant={(d) =>
+          }}
+          onSetDeterminant={(d) => {
+            audio.play('confirm')
             dispatch({ type: 'SET_MPDS_DETERMINANT', determinant: d })
-          }
-          onTriage={(level) => dispatch({ type: 'SET_TRIAGE', level })}
+          }}
+          onTriage={(level) => {
+            audio.play('confirm')
+            dispatch({ type: 'SET_TRIAGE', level })
+          }}
           onDispatch={handleDispatch}
-          onClose={() => setTerminalModalOpen(false)}
-          onEndCall={() => { setTerminalModalOpen(false); dispatch({ type: 'END_CALL' }) }}
+          onClose={handleCloseTerminal}
+          onEndCall={() => { setTerminalModalOpen(false); handleEndCall() }}
         />
       )}
     </div>
@@ -373,7 +481,9 @@ function PhoneHeader({
 }) {
   const mm = Math.floor(elapsed / 60)
   const ss = elapsed % 60
-  const urgent = elapsed >= 45
+  const timingState = getDispatchTimingState(elapsed)
+  const urgent = timingState !== 'normal'
+  const overdue = timingState === 'overtime'
   const si = STRESS_INFO[stressLevel]
 
   return (
@@ -394,7 +504,7 @@ function PhoneHeader({
           color: urgent ? '#f87171' : '#facc15',
           borderColor: urgent ? '#f87171' : '#facc15',
         }}>
-          {urgent ? '⚠ 超时' : '目标 60秒派车'}
+          {overdue ? '⚠ 超时' : urgent ? '⚠ 即将超时' : '目标 60秒派车'}
         </span>
       </div>
 
@@ -594,6 +704,7 @@ function QuestionPanel({
   onCalm,
   onOpenTerminal,
   hasTriage,
+  responseMode,
 }: {
   call: import('../game/types').EmergencyScenario
   askedMPDS: string[]
@@ -604,6 +715,7 @@ function QuestionPanel({
   onCalm: () => void
   onOpenTerminal: () => void
   hasTriage: boolean
+  responseMode: TerminalState['hotCold']
 }) {
   const isAsked = (id: string) => askedMPDS.includes(id)
   const si = STRESS_INFO[stressLevel]
@@ -616,6 +728,7 @@ function QuestionPanel({
   const step5Done = isAsked('step5_vitals')
   const landmarkDone = isAsked('ask_landmark')
   const contactDone = isAsked('ask_contact')
+  const purposeDone = isAsked('ask_purpose')
 
   const allFiveStepsDone = step1Done && step2Done && step3Done && step4Done && step5Done
 
@@ -643,9 +756,13 @@ function QuestionPanel({
           <span style={styles.qRefProto}>协议 {call.mpdsCard.number} 参考</span>
           <span style={{
             ...styles.qRefBadge,
-            backgroundColor: call.mpdsCard.hotCold === 'HOT' ? '#c0392b' : '#2e86c1',
+            backgroundColor: responseMode === 'HOT'
+              ? '#c0392b'
+              : responseMode === 'COLD'
+                ? '#2e86c1'
+                : '#475569',
           }}>
-            {call.mpdsCard.hotCold}
+            {responseMode ?? '待判定'}
           </span>
         </summary>
         <div style={styles.qRefList}>
@@ -767,6 +884,24 @@ function QuestionPanel({
               </div>
             )}
 
+            {!purposeDone && (
+              <AskBtnEx
+                id="ask_purpose"
+                label="求助诉求"
+                icon="🆘"
+                hintTerm="诉求"
+                timeCost={1}
+                done={false}
+                tier="important"
+                onClick={() => onAsk('ask_purpose')}
+              />
+            )}
+            {purposeDone && (
+              <div style={{ ...styles.qBtnSmall, borderColor: '#27ae60', color: '#4ade80', backgroundColor: '#1a3a1a' }}>
+                ✓ 诉求已确认
+              </div>
+            )}
+
             {/* 场景专属补充MPDS问题 */}
             {supplementaryQ.map((q) => (
               <AskBtnEx
@@ -847,7 +982,7 @@ const CATEGORY_ICON: Record<string, string> = {
 
 /** 增强问询按钮 — 带层级颜色 + 时间代价徽章 + 终端回填提示 */
 function AskBtnEx({
-  id: _id,
+  id,
   label,
   icon,
   hintTerm,
@@ -870,6 +1005,7 @@ function AskBtnEx({
   const ts = tier ? TIER_STYLE[tier] : undefined
   return (
     <button
+      data-question-id={id}
       style={{
         ...styles.qBtn,
         backgroundColor: done ? '#1a3a1a' : disabled ? '#1e293b' : (ts?.bg ?? '#0f172a'),
@@ -940,24 +1076,71 @@ function TerminalModal({
   onEndCall: () => void
 }) {
   const protocolNum = terminal.protocolNumber ?? mpdsCard.number
-  const detCode = terminal.determinant
-    ? `${protocolNum}-${terminal.determinant[0]}-?`
-    : mpdsCard.determinantCode
+  const modalRef = useRef<HTMLDivElement>(null)
+  const closeButtonRef = useRef<HTMLButtonElement>(null)
+  const detCode = formatPlayerDeterminantCode(protocolNum, terminal.determinant)
   const hasTriage = terminal.triage !== null
+  const hasDeterminant = terminal.determinant !== null
+  const hasDispatchDecision = hasTriage && hasDeterminant
+
+  useEffect(() => {
+    const previouslyFocused = document.activeElement instanceof HTMLElement
+      ? document.activeElement
+      : null
+    closeButtonRef.current?.focus()
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        event.preventDefault()
+        onClose()
+        return
+      }
+
+      if (event.key !== 'Tab' || !modalRef.current) return
+      const focusable = Array.from(modalRef.current.querySelectorAll<HTMLElement>(
+        'button:not([disabled]), input:not([disabled]), textarea:not([disabled]), summary, [tabindex]:not([tabindex="-1"])',
+      ))
+      if (focusable.length === 0) return
+
+      const first = focusable[0]
+      const last = focusable[focusable.length - 1]
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault()
+        last.focus()
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault()
+        first.focus()
+      }
+    }
+
+    document.addEventListener('keydown', handleKeyDown)
+    return () => {
+      document.removeEventListener('keydown', handleKeyDown)
+      previouslyFocused?.focus()
+    }
+  }, [onClose])
 
   return (
     <div style={styles.modalOverlay} onClick={onClose}>
-      <div style={styles.modalCard} onClick={(e) => e.stopPropagation()}>
+      <div
+        ref={modalRef}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="mpds-dialog-title"
+        style={styles.modalCard}
+        onClick={(e) => e.stopPropagation()}
+      >
         {/* 模态框头部 */}
         <div style={styles.modalHeader}>
           <div style={styles.modalHeaderLeft}>
             <span style={styles.mpdsModalBadge}>协议 {protocolNum}</span>
             <div>
-              <div style={{ fontSize: 15, fontWeight: 'bold', color: '#e2e8f0' }}>
+              <div id="mpds-dialog-title" style={{ fontSize: 15, fontWeight: 'bold', color: '#e2e8f0' }}>
                 MPDS 调度终端
               </div>
               <div style={{ fontSize: 12, color: '#94a3b8' }}>
                 {mpdsCard.title} | 判定码：{detCode}
+                {!terminal.determinant && '（待判定）'}
               </div>
             </div>
           </div>
@@ -967,12 +1150,22 @@ function TerminalModal({
               borderRadius: 12,
               fontSize: 12,
               fontWeight: 'bold',
-              backgroundColor: terminal.hotCold === 'HOT' ? '#c0392b' : '#2e86c1',
+              backgroundColor: terminal.hotCold === 'HOT'
+                ? '#c0392b'
+                : terminal.hotCold === 'COLD'
+                  ? '#2e86c1'
+                  : '#475569',
               color: '#fff',
             }}>
-              {terminal.hotCold ?? mpdsCard.hotCold}
+              {terminal.hotCold ?? '待判定'}
             </span>
-            <button style={styles.modalCloseBtn} onClick={onClose} title="关闭调度卡">
+            <button
+              ref={closeButtonRef}
+              style={styles.modalCloseBtn}
+              onClick={onClose}
+              title="关闭调度卡"
+              aria-label="关闭调度卡"
+            >
               ✕
             </button>
           </div>
@@ -1020,15 +1213,15 @@ function TerminalModal({
               <button
                 style={{
                   ...styles.modalDispatchBtn,
-                  opacity: hasTriage ? 1 : 0.5,
-                  cursor: hasTriage ? 'pointer' : 'not-allowed',
+                  opacity: hasDispatchDecision ? 1 : 0.5,
+                  cursor: hasDispatchDecision ? 'pointer' : 'not-allowed',
                 }}
                 onClick={onDispatch}
-                disabled={!hasTriage}
-                title={!hasTriage ? '请先选择分诊等级' : '确认派车'}
+                disabled={!hasDispatchDecision}
+                title={!hasDispatchDecision ? '请先选择MPDS判定码和分诊等级' : '确认派车'}
               >
                 🚑 确认派车
-                {!hasTriage && <span style={{ display: 'block', fontSize: 10, opacity: 0.8 }}>← 请先分诊</span>}
+                {!hasDispatchDecision && <span style={{ display: 'block', fontSize: 10, opacity: 0.8 }}>← 请完成判定</span>}
               </button>
             </>
           ) : (
@@ -1052,9 +1245,9 @@ function TerminalModal({
         </div>
 
         {/* 未选分诊提示 */}
-        {!hasTriage && !dispatchSent && canDispatch && (
+        {!hasDispatchDecision && !dispatchSent && canDispatch && (
           <div style={styles.modalWarning}>
-            ⚠️ 请在下方选择分诊等级后，才能派出救护车
+            ⚠️ 请在下方选择 MPDS 判定码和分诊等级后，才能派出救护车
           </div>
         )}
       </div>
@@ -1144,8 +1337,9 @@ function TerminalForm({
       <SectionTitle icon="📋" text="病例录入 (Protocol 0)" />
 
       {/* 地址 */}
-      <FieldRow icon="📍" label="事件地址">
+      <FieldRow inputId="terminal-address" icon="📍" label="事件地址">
         <textarea
+          id="terminal-address"
           style={styles.formInput}
           value={terminal.address}
           onChange={(e) => onChange('address', e.target.value)}
@@ -1155,8 +1349,9 @@ function TerminalForm({
       </FieldRow>
 
       {/* 联系电话 */}
-      <FieldRow icon="📞" label="联系电话">
+      <FieldRow inputId="terminal-contact" icon="📞" label="联系电话">
         <input
+          id="terminal-contact"
           style={{ ...styles.formInput, height: 30 }}
           value={terminal.contact}
           onChange={(e) => onChange('contact', e.target.value)}
@@ -1165,8 +1360,9 @@ function TerminalForm({
       </FieldRow>
 
       {/* 主诉 */}
-      <FieldRow icon="🩺" label="主诉 (Chief Complaint)">
+      <FieldRow inputId="terminal-complaint" icon="🩺" label="主诉 (Chief Complaint)">
         <input
+          id="terminal-complaint"
           style={{ ...styles.formInput, height: 30 }}
           value={terminal.chiefComplaint}
           onChange={(e) => onChange('chiefComplaint', e.target.value)}
@@ -1177,8 +1373,9 @@ function TerminalForm({
       {/* 患者基本信息 */}
       <div style={{ display: 'flex', gap: 6 }}>
         <div style={{ flex: 1 }}>
-          <FieldRow icon="👤" label="年龄">
+          <FieldRow inputId="terminal-age" icon="👤" label="年龄">
             <input
+              id="terminal-age"
               style={{ ...styles.formInput, height: 28 }}
               value={terminal.patientAge}
               onChange={(e) => onChange('patientAge', e.target.value)}
@@ -1187,8 +1384,9 @@ function TerminalForm({
           </FieldRow>
         </div>
         <div style={{ flex: 1 }}>
-          <FieldRow icon="⚧" label="性别">
+          <FieldRow inputId="terminal-gender" icon="⚧" label="性别">
             <input
+              id="terminal-gender"
               style={{ ...styles.formInput, height: 28 }}
               value={terminal.patientGender}
               onChange={(e) => onChange('patientGender', e.target.value)}
@@ -1206,10 +1404,10 @@ function TerminalForm({
         label="意识状态"
         field="conscious"
         value={terminal.conscious}
-        trueLabel="无意识"
-        falseLabel="有意识"
-        colorTrue="#e74c3c"
-        colorFalse="#27ae60"
+        trueLabel="有意识"
+        falseLabel="无意识"
+        colorTrue="#27ae60"
+        colorFalse="#e74c3c"
         onToggle={onSetStatus}
       />
 
@@ -1218,10 +1416,10 @@ function TerminalForm({
         label="呼吸状态"
         field="breathing"
         value={terminal.breathing}
-        trueLabel="无呼吸/异常"
-        falseLabel="正常呼吸"
-        colorTrue="#e74c3c"
-        colorFalse="#27ae60"
+        trueLabel="正常呼吸"
+        falseLabel="无呼吸/异常"
+        colorTrue="#27ae60"
+        colorFalse="#e74c3c"
         onToggle={onSetStatus}
       />
 
@@ -1245,6 +1443,7 @@ function TerminalForm({
               color: terminal.triage === opt.level ? '#fff' : opt.color,
             }}
             onClick={() => onTriage(opt.level)}
+            aria-pressed={terminal.triage === opt.level}
           >
             <div style={{ fontWeight: 'bold', fontSize: 14 }}>{opt.label}</div>
             <div style={{ fontSize: 10 }}>{opt.desc}</div>
@@ -1255,6 +1454,7 @@ function TerminalForm({
       {/* ====== 备注 ====== */}
       <SectionTitle icon="📝" text="事件备注" />
       <textarea
+        aria-label="事件备注"
         style={styles.formInput}
         value={terminal.conditionNote}
         onChange={(e) => onChange('conditionNote', e.target.value)}
@@ -1285,17 +1485,19 @@ function SectionTitle({ icon, text }: { icon: string; text: string }) {
 
 /** 单行输入框 */
 function FieldRow({
+  inputId,
   icon,
   label,
   children,
 }: {
+  inputId: string
   icon: string
   label: string
   children: React.ReactNode
 }) {
   return (
     <div style={{ marginBottom: 6 }}>
-      <label style={styles.formLabel}>
+      <label htmlFor={inputId} style={styles.formLabel}>
         {icon} {label}
       </label>
       {children}
@@ -1338,8 +1540,10 @@ function StatusToggle({
             fontSize: 12,
             cursor: 'pointer',
             fontWeight: value === true ? 'bold' : 'normal',
+            minHeight: 44,
           }}
           onClick={() => onToggle(field, true)}
+          aria-pressed={value === true}
         >
           {trueLabel}
         </button>
@@ -1354,8 +1558,10 @@ function StatusToggle({
             fontSize: 12,
             cursor: 'pointer',
             fontWeight: value === false ? 'bold' : 'normal',
+            minHeight: 44,
           }}
           onClick={() => onToggle(field, false)}
+          aria-pressed={value === false}
         >
           {falseLabel}
         </button>
@@ -1400,8 +1606,10 @@ function DeterminantSelector({
               fontWeight: isActive ? 'bold' : 'normal',
               cursor: 'pointer',
               minWidth: 50,
+              minHeight: 44,
             }}
             onClick={() => onSelect(l.key)}
+            aria-pressed={isActive}
           >
             <div style={{ fontWeight: 'bold' }}>{l.label}</div>
             <div style={{ fontSize: 9, opacity: 0.85 }}>{l.desc}</div>
@@ -1562,6 +1770,8 @@ const styles: Record<string, React.CSSProperties> = {
     display: 'flex',
     alignItems: 'center',
     justifyContent: 'space-between',
+    flexWrap: 'wrap' as const,
+    gap: 6,
     padding: '6px 10px',
     borderTop: '1px solid #1e293b',
     backgroundColor: '#020617',
@@ -1578,6 +1788,7 @@ const styles: Record<string, React.CSSProperties> = {
     fontFamily: 'monospace',
     letterSpacing: 0.5,
     transition: 'all 0.2s',
+    minHeight: 44,
   },
   calmBtn: {
     padding: '3px 10px',
@@ -1589,6 +1800,7 @@ const styles: Record<string, React.CSSProperties> = {
     fontWeight: 'bold',
     cursor: 'pointer',
     whiteSpace: 'nowrap' as const,
+    minHeight: 44,
   },
   // 协议卡参考清单
   qRefCard: {
@@ -1677,6 +1889,7 @@ const styles: Record<string, React.CSSProperties> = {
     whiteSpace: 'nowrap' as const,
     transition: 'all 0.15s',
     fontFamily: 'monospace',
+    minHeight: 44,
   },
   qBtnSmall: {
     padding: '3px 8px',
@@ -1709,6 +1922,7 @@ const styles: Record<string, React.CSSProperties> = {
     fontSize: 11,
     transition: 'all 0.15s',
     lineHeight: '1.3',
+    minHeight: 44,
   },
 
   // ---------- 急救指导 ----------
@@ -1752,6 +1966,7 @@ const styles: Record<string, React.CSSProperties> = {
     color: '#e2e8f0',
     textAlign: 'left' as const,
     transition: 'all 0.15s',
+    minHeight: 44,
   },
 
   // ---------- 收尾 ----------
@@ -1770,6 +1985,7 @@ const styles: Record<string, React.CSSProperties> = {
     fontSize: 14,
     fontWeight: 'bold',
     cursor: 'pointer',
+    minHeight: 44,
   },
 
   // ---------- MPDS 调度卡模态框 ----------
@@ -1784,7 +2000,7 @@ const styles: Record<string, React.CSSProperties> = {
     backdropFilter: 'blur(2px)',
   },
   modalCard: {
-    width: 560,
+    width: 'min(560px, calc(100vw - 24px))',
     maxHeight: '90vh',
     backgroundColor: '#0f172a',
     borderRadius: 10,
@@ -1831,6 +2047,8 @@ const styles: Record<string, React.CSSProperties> = {
     cursor: 'pointer',
     fontSize: 14,
     fontWeight: 'bold',
+    minWidth: 44,
+    minHeight: 44,
   },
   modalBody: {
     flex: 1,
@@ -1909,6 +2127,7 @@ const styles: Record<string, React.CSSProperties> = {
     padding: '10px 16px',
     borderTop: '1px solid #334155',
     backgroundColor: '#020617',
+    flexWrap: 'wrap' as const,
   },
   modalDispatchBtn: {
     padding: '10px 24px',
@@ -1920,6 +2139,7 @@ const styles: Record<string, React.CSSProperties> = {
     fontWeight: 'bold',
     cursor: 'pointer',
     transition: 'all 0.15s',
+    minHeight: 44,
   },
   modalSaveBtn: {
     padding: '8px 16px',
@@ -1929,6 +2149,7 @@ const styles: Record<string, React.CSSProperties> = {
     borderRadius: 6,
     fontSize: 12,
     cursor: 'pointer',
+    minHeight: 44,
   },
   modalEndCallBtn: {
     padding: '8px 12px',
@@ -1938,6 +2159,7 @@ const styles: Record<string, React.CSSProperties> = {
     borderRadius: 6,
     fontSize: 11,
     cursor: 'pointer',
+    minHeight: 44,
   },
   modalWarning: {
     padding: '6px 16px',
@@ -1986,6 +2208,7 @@ const styles: Record<string, React.CSSProperties> = {
     fontFamily: 'monospace',
     resize: 'vertical' as const,
     boxSizing: 'border-box' as const,
+    minHeight: 44,
   },
 
   triageGrid: {
@@ -2000,6 +2223,7 @@ const styles: Record<string, React.CSSProperties> = {
     cursor: 'pointer',
     fontSize: 12,
     transition: 'all 0.15s',
+    minHeight: 44,
   },
 
   // ---------- 等待接听 — 紧急调度台 ----------

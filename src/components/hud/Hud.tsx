@@ -3,12 +3,14 @@
 // ============================================================
 
 import type { WorldState } from '../../game/types'
+import type { ReactNode } from 'react'
 
 interface Props {
   state: WorldState
+  actions?: ReactNode
 }
 
-export function Hud({ state }: Props) {
+export function Hud({ state, actions }: Props) {
   const minutes = Math.floor(state.shiftElapsed / 60)
   const seconds = state.shiftElapsed % 60
   const timeStr = `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`
@@ -75,6 +77,8 @@ export function Hud({ state }: Props) {
           </span>
         </div>
       )}
+
+      {actions && <div style={styles.actions}>{actions}</div>}
     </div>
   )
 }
@@ -89,6 +93,7 @@ const styles: Record<string, React.CSSProperties> = {
     borderBottom: '1px solid #1e293b',
     flexShrink: 0,
     minHeight: 36,
+    flexWrap: 'wrap' as const,
   },
   group: {
     display: 'flex',
@@ -109,5 +114,9 @@ const styles: Record<string, React.CSSProperties> = {
     color: '#e2e8f0',
     fontWeight: 'bold',
     fontFamily: 'monospace',
+  },
+  actions: {
+    display: 'flex',
+    alignItems: 'center',
   },
 }

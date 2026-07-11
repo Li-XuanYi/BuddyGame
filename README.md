@@ -1,46 +1,57 @@
-# AI不眠城：黄金十二分钟
+# 零点接线台（Zero-Hour Dispatch）
 
-> "在城市失控前，说服一群不一定听你命令的人。"
+一款以 120 急救调度为主题的短篇 Web 模拟游戏。玩家需要在来电者紧张、信息不完整的情况下完成标准问询、临床判断、MPDS 判定、分诊派车与现场急救指导。
 
-## 产品定义
+> 本项目是游戏原型，不构成医疗培训或现实急救建议；协议内容在正式发布前仍需由急救调度专业人员复核。
 
-一款用 GAL/视觉小说表现层包装的 AI 驱动的应急决策游戏。
+## 当前玩法
 
-- 台风"青鸟"即将登陆
-- 玩家是临时城市应急指挥官
-- 4 个核心 NPC，各有独立人格与底线
-- Promise Ledger：承诺会被记住，违约会有反噬
-- 8 轮，8-12 分钟一局
+- 每个班次随机抽取 5 通电话
+- 通过五步标准问询确认位置、事件、人数、年龄、意识与呼吸
+- 补充地址、联系电话、求助诉求和场景专属问题
+- 根据来电叙述完成临床判断和 MPDS 判定
+- 目标在 60 秒内完成派车；问询与安抚会推进游戏时间
+- 派车后完成现场急救指导，并按速度、信息、分诊、指导和判断错误结算
+- 本地 WebAudio 提供接通、问询、预警、派车和到达提示，并支持静音与音量记忆
+- 当前包含 6 个预编写场景及 4 档班次结局
 
 ## 技术栈
 
 - React 19 + TypeScript
 - Vite 6
 - Motion for React
-- Vitest + Playwright
+- Vitest + Testing Library
 - ESLint
 
-## 快速开始
+当前版本使用可测试、可复现的预编写场景；`src/ai` 仍是保留的扩展接口，不参与医疗判断或评分。
+
+当前仓库不包含第三方 AI 生成语音或克隆声音。VoxFlow Studio 等工具只可作为离线内容生产参考；任何未来语音资产都必须记录商业授权、音色来源、脚本版本和人工医疗审核结果，且不得在未经书面同意时克隆真实人物声音。医疗判定和急救关键指令不得由生成式语音服务动态决定。
+
+## 本地运行
 
 ```bash
 npm install
 npm run dev
+```
+
+## 质量检查
+
+```bash
 npm run typecheck
 npm run lint
-npm run test -- --run
+npm test -- --run
 npm run build
 ```
 
-## 项目结构
+## 目录结构
 
-```
+```text
 src/
-├── app/        # App shell & routing
-├── game/       # Core game engine (reducer, state, events, NPC)
-├── ai/         # AI adapter (mock / HTTP / fallback)
-├── components/ # UI components
-├── screens/    # Full-screen views
-├── styles/     # Global styles & tokens
-├── data/       # Static data (NPCs, incidents, demo sequences)
-└── assets/     # Images, audio
+├── audio/        # 本地非语言玩法提示音与音量控制
+├── app/          # 应用入口与页面切换
+├── components/   # HUD、场景和对话组件
+├── game/         # 状态、场景、评分、事件与 NPC 数据
+├── screens/      # 标题、游戏和结局页面
+├── styles/       # 全局样式与设计变量
+└── test/         # 测试初始化
 ```

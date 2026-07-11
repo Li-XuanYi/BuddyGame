@@ -3,7 +3,7 @@
 // 120急救调度模拟游戏核心逻辑
 // ============================================================
 
-import type { WorldState, DialogueLine, CallPhase, InfoQuality, JudgmentPrompt } from '../types'
+import type { WorldState, DialogueLine, InfoQuality, JudgmentPrompt, MpdsDeterminant } from '../types'
 import { stressToLevel } from '../types'
 import type { GameAction } from './actions'
 import {
@@ -41,6 +41,79 @@ function toneToInitialStress(tone: string): number {
     angry: 60,
   }
   return map[tone] ?? 40
+}
+
+/** 从 9-E-1 一类 MPDS 判定码推导玩家应选择的判定等级。 */
+function determinantFromCode(code: string): MpdsDeterminant | null {
+  const letter = code.split('-')[1]?.toUpperCase()
+  const map: Record<string, MpdsDeterminant> = {
+    E: 'ECHO',
+    D: 'DELTA',
+    C: 'CHARLIE',
+    B: 'BRAVO',
+    A: 'ALPHA',
+  }
+  return letter ? (map[letter] ?? null) : null
+}
+
+/** 错误或遗漏的临床判断会真实影响单通电话得分。 */
+function calculateDecisionPenalty(
+  judgments: JudgmentPrompt[],
+  expectedDeterminant: MpdsDeterminant | null,
+  selectedDeterminant: MpdsDeterminant | null,
+  expectedConscious: boolean | null,
+  selectedConscious: boolean | null,
+  expectedBreathing: boolean | null,
+  selectedBreathing: boolean | null,
+): number {
+  let penalty = 0
+
+  for (const judgment of judgments) {
+    if (judgment.chosenOptionIndex === null) {
+      penalty += 3
+      continue
+    }
+
+    if (!judgment.options[judgment.chosenOptionIndex]?.isCorrect) {
+      penalty += 5
+    }
+  }
+
+  if (expectedDeterminant && selectedDeterminant !== expectedDeterminant) {
+    penalty += 5
+  }
+
+  if (expectedConscious !== null && selectedConscious !== expectedConscious) {
+    penalty += 3
+  }
+
+  if (expectedBreathing !== null && selectedBreathing !== expectedBreathing) {
+    penalty += 3
+  }
+
+  return Math.min(20, penalty)
+}
+
+function expectedVital(
+  call: WorldState['currentCall'],
+  field: 'conscious' | 'breathing',
+): boolean | null {
+  if (!call) return null
+  const consciousness = call.fourElements.condition.consciousness
+  const breathing = call.fourElements.condition.breathing
+  const isUnconscious = consciousness.includes('无意识')
+    || consciousness.includes('不醒')
+    || consciousness.includes('呼之不应')
+    || consciousness.includes('昏迷')
+  const isBreathingAbnormal = breathing.includes('没有呼吸')
+    || breathing.includes('无呼吸')
+    || breathing.includes('窒息')
+    || breathing.includes('胸口不动')
+    || breathing.includes('急促')
+    || breathing.includes('喘')
+    || breathing.includes('异常')
+
+  return field === 'conscious' ? !isUnconscious : !isBreathingAbnormal
 }
 
 /** 生成步骤1（位置确认）的叙述式回答 */
@@ -179,7 +252,6 @@ export function worldReducer(state: WorldState, action: GameAction): WorldState 
       // 终端不再自动填入 — 玩家从对话中提取
       const terminal = createTerminalState()
       terminal.protocolNumber = scenario.mpdsCard.number
-      terminal.hotCold = scenario.mpdsCard.hotCold
 
       return {
         ...state,
@@ -206,7 +278,7 @@ export function worldReducer(state: WorldState, action: GameAction): WorldState 
     case 'ASK_QUESTION': {
       const { questionId } = action
       const call = state.currentCall
-      let cs = state.callerState
+      const cs = state.callerState
       if (!call || !cs) return state
       if (state.callPhase !== 'questioning' && state.callPhase !== 'connected') return state
       if (cs.askedMPDS.includes(questionId)) return state
@@ -220,7 +292,7 @@ export function worldReducer(state: WorldState, action: GameAction): WorldState 
       let newStress = cs.stress
       let timeCost = 0
       let stressEffect = 0
-      let newJudgments: JudgmentPrompt[] = [...(state.pendingJudgments ?? [])]
+      const newJudgments: JudgmentPrompt[] = [...(state.pendingJudgments ?? [])]
       let newTerminal = { ...state.terminal }
 
       // ==========================================
@@ -380,6 +452,15 @@ export function worldReducer(state: WorldState, action: GameAction): WorldState 
         newTerminal = { ...newTerminal, contact: call.fourElements.contact }
       }
 
+      // --- 求助诉求（四要素之一）---
+      else if (questionId === 'ask_purpose') {
+        timeCost = 1; stressEffect = -2
+        newDialogue.push({ speaker: 'operator', text: '请明确告诉我，您现在最需要我们提供什么帮助？', timestamp: now })
+        newDialogue.push({ speaker: 'caller', text: call.fourElements.purpose, timestamp: now })
+        newRevealed.purpose = true
+        newInfoQuality['purpose'] = newStress >= 75 ? 'partial' : 'clear'
+      }
+
       // --- MPDS 标准问询 ---
       else {
         const mpdsQ = call.mpdsQuestions.find(q => q.id === questionId)
@@ -453,9 +534,23 @@ export function worldReducer(state: WorldState, action: GameAction): WorldState 
 
       const updatedRevealed = { ...newRevealed, address: newAddress }
 
+      for (const evt of call.specialEvents) {
+        const matchesQuestion = !evt.triggerValue || evt.triggerValue === questionId
+        const alreadyInserted = state.dialogueLog.some(line => line.text === evt.dialogue)
+          || newDialogue.some(line => line.text === evt.dialogue)
+        if (evt.trigger === 'after_question' && matchesQuestion && !alreadyInserted) {
+          newDialogue.push({
+            speaker: 'caller',
+            text: evt.dialogue,
+            timestamp: now + timeCost,
+          })
+        }
+      }
+
       return {
         ...state,
         callPhase: 'questioning',
+        shiftElapsed: state.shiftElapsed + timeCost,
         questionCost: state.questionCost + timeCost,
         pendingJudgments: newJudgments,
         terminal: newTerminal,
@@ -501,6 +596,7 @@ export function worldReducer(state: WorldState, action: GameAction): WorldState 
 
       return {
         ...state,
+        shiftElapsed: state.shiftElapsed + 2,
         questionCost: state.questionCost + 2,   // 安抚消耗2秒
         callerState: {
           ...cs,
@@ -546,6 +642,9 @@ export function worldReducer(state: WorldState, action: GameAction): WorldState 
         terminal: {
           ...state.terminal,
           determinant: action.determinant,
+          hotCold: action.determinant === 'ECHO' || action.determinant === 'DELTA'
+            ? 'HOT'
+            : 'COLD',
         },
       }
     }
@@ -603,6 +702,7 @@ export function worldReducer(state: WorldState, action: GameAction): WorldState 
     case 'DISPATCH': {
       if (!state.currentCall || !state.callerState) return state
       if (state.dispatchSent) return state
+      if (!state.terminal.determinant || !state.terminal.triage) return state
 
       const dispatchTime = state.shiftElapsed - state.callStartTime
       const rawAddress = state.callerState.revealedInfo.address
@@ -610,7 +710,7 @@ export function worldReducer(state: WorldState, action: GameAction): WorldState 
         rawAddress === 'none' ? 'vague' : rawAddress
 
       // 如果没选分诊，默认用场景预设
-      const triage = state.terminal.triage || state.currentCall.correctTriage
+      const triage = state.terminal.triage
 
       const eta = calcAmbulanceETA(dispatchTime, addressCompleteness)
 
@@ -619,6 +719,15 @@ export function worldReducer(state: WorldState, action: GameAction): WorldState 
         text: `【🚑 救护车已派出 — 分诊等级: ${triage === 'red' ? '红色(濒危)' : triage === 'yellow' ? '黄色(危重)' : triage === 'green' ? '绿色(轻伤)' : '黑色'} | 预计到达: ${eta}秒 | 派车耗时: ${dispatchTime}秒】`,
         timestamp: state.shiftElapsed,
       }
+
+      const dispatchEventLines: DialogueLine[] = state.currentCall.specialEvents
+        .filter(evt => evt.trigger === 'after_dispatch')
+        .filter(evt => !state.dialogueLog.some(line => line.text === evt.dialogue))
+        .map(evt => ({
+          speaker: 'caller' as const,
+          text: evt.dialogue,
+          timestamp: state.shiftElapsed,
+        }))
 
       const record = {
         callId: state.currentCall.id,
@@ -642,7 +751,7 @@ export function worldReducer(state: WorldState, action: GameAction): WorldState 
         guidanceResults: hasGuidance
           ? new Array(state.currentCall.guidance!.steps.length).fill(null)
           : [],
-        dialogueLog: [...state.dialogueLog, systemLine],
+        dialogueLog: [...state.dialogueLog, systemLine, ...dispatchEventLines],
       }
     }
 
@@ -706,16 +815,33 @@ export function worldReducer(state: WorldState, action: GameAction): WorldState 
       let info = 0
       let triageScore = 0
       let guidanceScore = 0
+      let decisionPenalty = 0
 
       // 恶作剧电话特殊评分
       if (call.isPrank) {
         if (!didDispatch) {
-          // 正确识别恶作剧 → 满分
-          total = 100
-          speed = 40
-          info = 30
-          triageScore = 20
-          guidanceScore = 10
+          const correctlyIdentified = state.pendingJudgments.some(judgment => {
+            const selected = judgment.chosenOptionIndex
+            return judgment.questionId === 'mpds_prank_patient'
+              && selected !== null
+              && judgment.options[selected]?.isCorrect === true
+          })
+          if (correctlyIdentified) {
+            // 完成核实并正确识别恶作剧。
+            total = 100
+            speed = 40
+            info = 30
+            triageScore = 20
+            guidanceScore = 10
+          } else {
+            // 未核实便挂断，避免玩家在接通后立即挂断刷满分。
+            total = 40
+            speed = 20
+            info = 10
+            triageScore = 10
+            guidanceScore = 0
+            decisionPenalty = 60
+          }
         } else {
           // 错误派车 → 0分
           total = 0
@@ -723,6 +849,7 @@ export function worldReducer(state: WorldState, action: GameAction): WorldState 
           info = 0
           triageScore = 0
           guidanceScore = 0
+          decisionPenalty = 100
         }
       } else {
         // 统计信息质量加分
@@ -740,10 +867,18 @@ export function worldReducer(state: WorldState, action: GameAction): WorldState 
           call.correctTriage,
           state.guidanceResults.filter(r => r === 'correct').length,
           state.guidanceResults.length,
-          state.questionCost,
           qualityBonus,
         )
-        total = result.total
+        decisionPenalty = calculateDecisionPenalty(
+          state.pendingJudgments,
+          determinantFromCode(call.mpdsCard.determinantCode),
+          state.terminal.determinant,
+          expectedVital(call, 'conscious'),
+          state.terminal.conscious,
+          expectedVital(call, 'breathing'),
+          state.terminal.breathing,
+        )
+        total = Math.max(0, result.total - decisionPenalty)
         speed = result.speed
         info = result.info
         triageScore = result.triage
@@ -756,7 +891,7 @@ export function worldReducer(state: WorldState, action: GameAction): WorldState 
       // 通话结束的总结行
       const summaryLine: DialogueLine = {
         speaker: 'system',
-        text: `【通话结束 | 得分: ${total}/100 — 派车速度:${speed} 信息:${info} 分诊:${triageScore} 指导:${guidanceScore}】`,
+        text: `【通话结束 | 得分: ${total}/100 — 派车速度:${speed} 信息:${info} 分诊:${triageScore} 指导:${guidanceScore} 判断扣分:${decisionPenalty}】`,
         timestamp: state.shiftElapsed,
       }
 
@@ -785,7 +920,6 @@ export function worldReducer(state: WorldState, action: GameAction): WorldState 
 
       const newElapsed = state.shiftElapsed + 1
       let newAmbulanceRemaining = state.ambulanceRemaining
-      let newCallPhase = state.callPhase as CallPhase
       const newDialogue: DialogueLine[] = []
 
       // 救护车倒计时
@@ -806,8 +940,8 @@ export function worldReducer(state: WorldState, action: GameAction): WorldState 
           if (evt.trigger === 'time_elapsed' && evt.triggerValue) {
             const triggerSec = parseInt(evt.triggerValue, 10)
             const callTime = newElapsed - state.callStartTime
-            // 在触发秒数时触发（仅一次）
-            if (callTime === triggerSec) {
+            // 游戏内问询会推进数秒；使用 >= 避免跨过触发时刻后漏掉事件。
+            if (callTime >= triggerSec) {
               // 检查是否已经插入过这个事件
               const alreadyInserted = state.dialogueLog.some(
                 l => l.text === evt.dialogue
@@ -828,7 +962,6 @@ export function worldReducer(state: WorldState, action: GameAction): WorldState 
         ...state,
         shiftElapsed: newElapsed,
         ambulanceRemaining: newAmbulanceRemaining,
-        callPhase: newCallPhase,
         dialogueLog: state.dialogueLog.length > 0 || newDialogue.length > 0
           ? [...state.dialogueLog, ...newDialogue]
           : state.dialogueLog,

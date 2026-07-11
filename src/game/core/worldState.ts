@@ -59,11 +59,20 @@ function shuffle<T>(arr: T[]): T[] {
 }
 
 /** 获取本班次的场景队列（随机打乱顺序） */
-export function buildScenarioQueue(_shiftNumber: number): string[] {
+export function buildScenarioQueue(shiftNumber: number): string[] {
   // 每个班次5通电话，从所有场景中随机选5个
   const pool = [...SCENARIO_IDS]
   const shuffled = shuffle(pool)
-  return shuffled.slice(0, 5)
+  const selected = shuffled.slice(0, 5)
+
+  // 恶作剧电话不能作为班次最后一通，避免用最简单的题目收尾。
+  const lastIndex = selected.length - 1
+  if (selected[lastIndex] === 'prank_call' && lastIndex > 0) {
+    const swapIndex = shiftNumber % lastIndex
+    ;[selected[swapIndex], selected[lastIndex]] = [selected[lastIndex], selected[swapIndex]]
+  }
+
+  return selected
 }
 
 /** 创建初始世界状态 */
@@ -152,11 +161,10 @@ export function scoreCall(
   correctTriage: TriageLevel,
   guidanceCorrect: number,
   guidanceTotal: number,
-  questionCost = 0,
   infoQualityBonus = 0,
 ): CallScore {
-  // 1. 派车速度分（0-40）— 扣除问询耗时后评估"净决策速度"
-  const netTime = dispatchTime !== null ? Math.max(10, dispatchTime - Math.min(questionCost, 30)) : null
+  // 1. 派车速度分（0-40）— 问询会真实推进游戏时钟，因此直接使用派车耗时。
+  const netTime = dispatchTime
   let speed = 0
   if (netTime !== null) {
     if (netTime <= 27) speed = 40
